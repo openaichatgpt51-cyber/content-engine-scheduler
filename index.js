@@ -6,6 +6,10 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY
 const N8N_WEBHOOK_URL     = process.env.N8N_WEBHOOK_URL
 const N8N_WEBHOOK_SECRET  = process.env.N8N_WEBHOOK_SECRET
 const INTERVAL_MS         = 60_000 // run every 60 seconds
+// A post that has sat in IN_PROGRESS longer than this never got a result back
+// from n8n (n8n answers the webhook immediately, so a 200 here only means
+// "started", not "published"). Normal publishing takes seconds to a few minutes.
+const STUCK_AFTER_MINUTES = Number(process.env.STUCK_AFTER_MINUTES || 15)
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !N8N_WEBHOOK_URL) {
   console.error('Missing required environment variables')
@@ -15,6 +19,67 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !N8N_WEBHOOK_URL) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false }
 })
+
+// ── reapStuckPosts ────────────────────────────────────────────────────────
+// Safety net: any post still IN_PROGRESS after STUCK_AFTER_MINUTES is marked
+// FAILED (not re-queued) so it shows up in the dashboard's Notifications and
+// can be retried by a person. Re-queueing automatically could publish the
+// same post twice if n8n actually posted but failed to record it.
+async function reapStuckPosts() {
+  const cutoff = new Date(Date.now() - STUCK_AFTER_MINUTES * 60_000).toISOString()
+
+  try {
+    const { data: stuck, error } = await supabase
+      .from('posts')
+      .select('id, client_id, topic, platforms')
+      .eq('posting_status', 'IN_PROGRESS')
+      .lt('updated_at', cutoff)
+
+    if (error) {
+      console.error('Stuck-post query error:', error.message)
+      return
+    }
+    if (!stuck || stuck.length === 0) return
+
+    for (const post of stuck) {
+      // Re-check status AND age in the same statement, so a post that n8n
+      // finished (or that was just re-claimed) a moment ago is left alone.
+      const { data: flipped, error: updErr } = await supabase
+        .from('posts')
+        .update({ posting_status: 'FAILED', updated_at: new Date().toISOString() })
+        .eq('id', post.id)
+        .eq('posting_status', 'IN_PROGRESS')
+        .lt('updated_at', cutoff)
+        .select('id')
+
+      if (updErr) {
+        console.error(`Could not mark ${post.id} as FAILED:`, updErr.message)
+        continue
+      }
+      if (!flipped || flipped.length === 0) continue
+
+      console.warn(`⚠️  Marked stuck post as FAILED: "${post.topic}" (${post.id})`)
+
+      // Best-effort: leave a reason the dashboard can show. Never let a
+      // logging problem stop the sweep.
+      try {
+        const platform = (post.platforms || '').split(',')[0].trim().toLowerCase() || 'linkedin'
+        const { error: logErr } = await supabase.from('error_logs').insert({
+          client_id:     post.client_id,
+          post_id:       post.id,
+          node_name:     'scheduler',
+          platform,
+          error_message: `No result from n8n within ${STUCK_AFTER_MINUTES} minutes of starting. Check the platform to confirm it was not published, then retry.`,
+        })
+        if (logErr) console.error(`error_logs insert failed for ${post.id}:`, logErr.message)
+      } catch (logEx) {
+        console.error(`error_logs insert threw for ${post.id}:`, logEx.message)
+      }
+    }
+  } catch (err) {
+    console.error('Unexpected error in reapStuckPosts:', err.message)
+  }
+}
 
 // ── checkDuePosts ─────────────────────────────────────────────────────────
 async function checkDuePosts() {
@@ -47,7 +112,7 @@ async function checkDuePosts() {
         // Mark as IN_PROGRESS first to prevent double-triggering
         await supabase
           .from('posts')
-          .update({ posting_status: 'IN_PROGRESS' })
+          .update({ posting_status: 'IN_PROGRESS', updated_at: new Date().toISOString() })
           .eq('id', post.id)
 
         const headers = {
@@ -100,6 +165,14 @@ console.log(`Checking every ${INTERVAL_MS / 1000}s`)
 console.log(`Supabase: ${SUPABASE_URL}`)
 console.log(`n8n webhook: ${N8N_WEBHOOK_URL}`)
 
+// One tick = recover anything stuck, then trigger what is due.
+async function tick() {
+  await reapStuckPosts()
+  await checkDuePosts()
+}
+
+console.log(`Stuck-post timeout: ${STUCK_AFTER_MINUTES} min`)
+
 // Run immediately on start, then on interval
-checkDuePosts()
-setInterval(checkDuePosts, INTERVAL_MS)
+tick()
+setInterval(tick, INTERVAL_MS)

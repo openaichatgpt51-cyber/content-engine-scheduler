@@ -5,11 +5,15 @@ const SUPABASE_URL        = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY
 const N8N_WEBHOOK_URL     = process.env.N8N_WEBHOOK_URL
 const N8N_WEBHOOK_SECRET  = process.env.N8N_WEBHOOK_SECRET
+const N8N_WEBHOOK_HEADER  = process.env.N8N_WEBHOOK_HEADER || 'apikey'
 const INTERVAL_MS         = 60_000 // run every 60 seconds
 // A post that has sat in IN_PROGRESS longer than this never got a result back
 // from n8n (n8n answers the webhook immediately, so a 200 here only means
 // "started", not "published"). Normal publishing takes seconds to a few minutes.
 const STUCK_AFTER_MINUTES = Number(process.env.STUCK_AFTER_MINUTES || 15)
+// How long after hand-off we look at what n8n actually did. A due platform that
+// is still not marked posted by then was discarded or failed inside n8n.
+const VERIFY_AFTER_MINUTES = Number(process.env.VERIFY_AFTER_MINUTES || 3)
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !N8N_WEBHOOK_URL) {
   console.error('Missing required environment variables')
@@ -119,6 +123,9 @@ async function checkDuePosts() {
           'Content-Type': 'application/json',
         }
         if (N8N_WEBHOOK_SECRET) {
+          // Must match the header name in the n8n Header Auth credential bound to
+          // the posting-trigger webhook (set N8N_WEBHOOK_HEADER, default "apikey").
+          headers[N8N_WEBHOOK_HEADER] = N8N_WEBHOOK_SECRET
           headers['x-webhook-secret'] = N8N_WEBHOOK_SECRET
         }
 
@@ -159,6 +166,89 @@ async function checkDuePosts() {
   }
 }
 
+// ── verifyHandoffs ────────────────────────────────────────────────────────
+// n8n answers the webhook with 200 before it posts anything, so "triggered"
+// does not mean "published". A few minutes after hand-off, compare what was
+// due with what n8n recorded as posted. Any due platform still not posted is
+// reported by name and the post is marked FAILED right away (not re-queued,
+// so nothing can be published twice). A person can fix the cause and retry.
+const PLATFORMS = [
+  { key: 'linkedin',  label: 'LinkedIn',  match: 'linkedin' },
+  { key: 'instagram', label: 'Instagram', match: 'instagram' },
+  { key: 'twitter',   label: 'X',         match: 'twitter' },
+]
+
+function missedPlatforms(post, nowMs) {
+  const wanted = (post.platforms || '').toLowerCase()
+  const missed = []
+  for (const p of PLATFORMS) {
+    if (!wanted.includes(p.match)) continue
+    const due = post[`${p.key}_scheduled_time`]
+    if (!due || new Date(due).getTime() > nowMs) continue // not due yet
+    if (String(post[`${p.key}_posted`] || '').toUpperCase() === 'YES') continue
+    missed.push(p)
+  }
+  return missed
+}
+
+async function verifyHandoffs() {
+  const cutoff = new Date(Date.now() - VERIFY_AFTER_MINUTES * 60_000).toISOString()
+  try {
+    const { data: posts, error } = await supabase
+      .from('posts')
+      .select('id, client_id, topic, platforms, updated_at, linkedin_scheduled_time, instagram_scheduled_time, twitter_scheduled_time, linkedin_posted, instagram_posted, twitter_posted')
+      .eq('posting_status', 'IN_PROGRESS')
+      .lt('updated_at', cutoff)
+
+    if (error) {
+      console.error('Verify query error:', error.message)
+      return
+    }
+    if (!posts || posts.length === 0) return
+
+    const nowMs = Date.now()
+    for (const post of posts) {
+      const missed = missedPlatforms(post, nowMs)
+      if (missed.length === 0) continue // everything due was posted; leave status to n8n
+
+      // Only flip if still IN_PROGRESS and untouched since we read it.
+      const { data: flipped, error: updErr } = await supabase
+        .from('posts')
+        .update({ posting_status: 'FAILED', updated_at: new Date().toISOString() })
+        .eq('id', post.id)
+        .eq('posting_status', 'IN_PROGRESS')
+        .eq('updated_at', post.updated_at)
+        .select('id')
+
+      if (updErr) {
+        console.error(`Could not mark ${post.id} as FAILED:`, updErr.message)
+        continue
+      }
+      if (!flipped || flipped.length === 0) continue
+
+      const names = missed.map(m => m.label).join(', ')
+      console.warn(`⚠️  n8n accepted but did not publish to ${names}: "${post.topic}" (${post.id})`)
+
+      for (const m of missed) {
+        try {
+          const { error: logErr } = await supabase.from('error_logs').insert({
+            client_id:     post.client_id,
+            post_id:       post.id,
+            node_name:     'scheduler',
+            platform:      m.key,
+            error_message: `n8n accepted the post but ${m.label} was not published within ${VERIFY_AFTER_MINUTES} minutes. Check the n8n execution for this post, confirm it is not on ${m.label}, then retry.`,
+          })
+          if (logErr) console.error(`error_logs insert failed for ${post.id}:`, logErr.message)
+        } catch (logEx) {
+          console.error(`error_logs insert threw for ${post.id}:`, logEx.message)
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Unexpected error in verifyHandoffs:', err.message)
+  }
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────
 console.log('Content Engine Scheduler starting…')
 console.log(`Checking every ${INTERVAL_MS / 1000}s`)
@@ -167,11 +257,12 @@ console.log(`n8n webhook: ${N8N_WEBHOOK_URL}`)
 
 // One tick = recover anything stuck, then trigger what is due.
 async function tick() {
+  await verifyHandoffs()
   await reapStuckPosts()
   await checkDuePosts()
 }
 
-console.log(`Stuck-post timeout: ${STUCK_AFTER_MINUTES} min`)
+console.log(`Stuck-post timeout: ${STUCK_AFTER_MINUTES} min, outcome check after ${VERIFY_AFTER_MINUTES} min`)
 
 // Run immediately on start, then on interval
 tick()
